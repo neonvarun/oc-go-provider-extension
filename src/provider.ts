@@ -35,6 +35,12 @@ import {
 } from "./utils";
 import type { LegacyPart } from "./utils";
 import { OcGoMcpClient } from "./mcp";
+import {
+  getThinkingSchemaForModel,
+  getThinkingParams,
+  createModelVariants,
+  parseVariantModelId,
+} from "./thinking";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -57,7 +63,7 @@ const BASE_URL = "https://opencode.ai/zen/go/v1";
 const MAX_TOOL_RESULT_CHARS = 20000;
 const MAX_TOOLS_PER_REQUEST = 128;
 const DEFAULT_MAX_TOKENS = 65536;
-const MAX_OCR_TOKENS = 2000;
+const MAX_OCR_TOKENS = 16000;
 const OCR_TRUNCATION_SUFFIX = "\n\n...[truncated image analysis]";
 
 /**
@@ -111,6 +117,13 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
 
   /** Debug counter */
   private _debugCallCount = 0;
+
+  /** Per-image hashes OCR'd this session + the message index where they appeared.
+   *  Only skip OCR when the same image reappears at the SAME message index
+   *  (VS Code re-attach). A new message index means the user deliberately
+   *  re-sent the image and wants fresh analysis. */
+  private _ocrImageState = new Map<string, number>();
+  private _lastNewestImageMsgIdx = -1;
 
   /** Event emitter for model information changes */
   private readonly _onDidChangeLanguageModelChatInformation =
@@ -193,33 +206,75 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
     const { OC_GO_MODELS: models } = await import("./types");
     console.log(`[OpenCode Go Provider] Found ${models.length} models`);
 
-    const infos: LanguageModelChatInformation[] = models.map(
-      (model: OcGoModelInfo) => {
-        console.log(`[OpenCode Go Provider] Model info: ${model.id}`, {
-          supportsVision: model.supportsVision,
-          supportsTools: model.supportsTools,
-          contextWindow: model.contextWindow,
-          maxOutput: model.maxOutput,
-        });
-        return {
-          id: model.id,
-          name: model.displayName,
-          detail: "OpenCode Go",
-          tooltip: `OpenCode Go ${model.name}`,
-          family: "opencode-go",
-          version: "1.0.0",
-          maxInputTokens: Math.max(
-            1,
-            model.contextWindow - Math.min(model.maxOutput, DEFAULT_MAX_TOKENS)
-          ),
-          maxOutputTokens: model.maxOutput,
-          capabilities: {
-            toolCalling: model.supportsTools ? MAX_TOOLS_PER_REQUEST : false,
-            imageInput: true, // Image input allowed; non-vision models auto-route
-          },
-        };
+    const infos: LanguageModelChatInformation[] = [];
+
+    for (const model of models) {
+      console.log(`[OpenCode Go Provider] Model info: ${model.id}`, {
+        supportsVision: model.supportsVision,
+        supportsTools: model.supportsTools,
+        contextWindow: model.contextWindow,
+        maxOutput: model.maxOutput,
+      });
+
+      const baseInfo = {
+        id: model.id,
+        name: model.displayName,
+        detail: "OpenCode Go",
+        tooltip: `OpenCode Go ${model.name}`,
+        family: "opencode-go",
+        version: "1.0.0",
+        maxInputTokens: Math.max(
+          1,
+          model.contextWindow - Math.min(model.maxOutput, DEFAULT_MAX_TOKENS)
+        ),
+        maxOutputTokens: model.maxOutput,
+        capabilities: {
+          toolCalling: model.supportsTools ? MAX_TOOLS_PER_REQUEST : false,
+          imageInput: true, // Image input allowed; non-vision models auto-route
+        },
+      } as LanguageModelChatInformation & {
+        configurationSchema?: Record<string, unknown>;
+      };
+
+      // Attach configurationSchema for Insiders builds that support the proposed API
+      // If configurationSchema is supported, emit a single model entry; otherwise
+      // create suffixed model variants (e.g. "deepseek-v4-pro-high") for stable VS Code
+      if (model.supportsReasoning) {
+        const schema = getThinkingSchemaForModel(model.id);
+        if (schema) {
+          baseInfo.configurationSchema = schema;
+          infos.push(baseInfo);
+        } else {
+          // Stable-API fallback: emit one model per thinking level
+          const variants = createModelVariants(model);
+          if (variants.length > 0) {
+            for (const variant of variants) {
+              infos.push({
+                id: variant.id,
+                name: variant.displayName,
+                detail: "OpenCode Go",
+                tooltip: `OpenCode Go ${variant.name}`,
+                family: "opencode-go",
+                version: "1.0.0",
+                maxInputTokens: Math.max(
+                  1,
+                  variant.contextWindow - Math.min(variant.maxOutput, DEFAULT_MAX_TOKENS)
+                ),
+                maxOutputTokens: variant.maxOutput,
+                capabilities: {
+                  toolCalling: variant.supportsTools ? MAX_TOOLS_PER_REQUEST : false,
+                  imageInput: true,
+                },
+              });
+            }
+          } else {
+            infos.push(baseInfo);
+          }
+        }
+      } else {
+        infos.push(baseInfo);
       }
-    );
+    }
 
     console.log(`[OpenCode Go Provider] Returning ${infos.length} models`);
     return infos;
@@ -234,29 +289,18 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
   }
 
   /**
-   * Pick a fallback vision model for image input
-   */
-  private getVisionFallbackModelId(): string | undefined {
-    const preferred = OC_GO_MODELS.find(
-      (m) => m.id === "mimo-v2-omni" && m.supportsVision
-    );
-    if (preferred) {
-      return preferred.id;
-    }
-    return OC_GO_MODELS.find((m) => m.supportsVision)?.id;
-  }
-
-  /**
-   * Check if any message contains image input parts
+   * Check if any message contains image input parts.
+   * Must scan ALL messages because OCR replacements from previous turns
+   * do NOT persist in VS Code conversation history — raw images remain
+   * and will crash non-vision models like DeepSeek if not stripped.
+   * (messages[42]: unknown variant image_url, expected text)
    */
   private hasImageInput(
     messages: readonly LanguageModelChatMessage[]
   ): boolean {
     for (const msg of messages) {
-      for (const part of msg.content) {
-        if (extractImageData(part)) {
-          return true;
-        }
+      if (msg.content.some((part) => extractImageData(part))) {
+        return true;
       }
     }
     return false;
@@ -300,8 +344,12 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
   }
 
   /**
-   * Pre-process messages to handle images
-   * Converts images to text descriptions using GLM-OCR MCP
+   * Pre-process messages to handle images for non-vision models.
+   *
+   * Strategy: only OCR images from the LAST message (the newest user turn).
+   * For older messages, images are simply stripped — their OCR text was
+   * already sent to the model on a previous turn and lives in context.
+   * This avoids redundant MiMo calls while keeping DeepSeek crash-free.
    */
   private async processImagesForNonVisionModel(
     messages: readonly LanguageModelChatMessage[],
@@ -314,8 +362,39 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
     const imageDescriptions: string[] = [];
     const processedMessages: LanguageModelChatMessage[] = [];
 
-    for (const msg of messages) {
-      // Extract text from message
+    // Find the newest message with images and build per-image hashes.
+    // Only skip OCR when the SAME image reappears at the SAME message index
+    // (VS Code re-attach). Different index = user deliberately re-sent → re-OCR.
+    let newestImageIdx = -1;
+    const imgHashes: string[] = [];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const imgs = messages[i].content
+        .map((p) => extractImageData(p))
+        .filter((x): x is NonNullable<typeof x> => !!x);
+      if (imgs.length > 0) {
+        for (const img of imgs) {
+          imgHashes.push(
+            img.mimeType +
+              "|" +
+              Buffer.from(
+                img.data.length <= 2048
+                  ? img.data
+                  : img.data.subarray(0, 1024),
+              ).toString("base64") +
+              "|" +
+              img.data.length,
+          );
+        }
+        newestImageIdx = i;
+        break;
+      }
+    }
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const isNewest = i === newestImageIdx;
+
+      // Extract text parts
       const textParts: string[] = [];
       for (const part of msg.content) {
         const v = getTextPartValue(part);
@@ -325,7 +404,7 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
       }
       const userPrompt = textParts.join(" ");
 
-      // Extract image data parts (supports DataPart and legacy shapes)
+      // Extract image data
       const images: Array<{ mimeType: string; data: Uint8Array }> = [];
       for (const part of msg.content) {
         const img = extractImageData(part);
@@ -335,51 +414,109 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
       }
 
       if (images.length === 0) {
-        // No images, keep message as-is
         processedMessages.push(msg);
         continue;
       }
 
-      // Analyze images for this message
-      const thisMessageDescriptions: string[] = [];
-      for (const img of images) {
-        if (token.isCancellationRequested) {
-          throw new vscode.CancellationError();
+      if (isNewest) {
+        // Per-image dedup: only OCR images that are new OR appear at a new index
+        const thisMessageDescriptions: string[] = [];
+        let anyOcred = false;
+        let anySkipped = false;
+        for (const img of images) {
+          const imgHash =
+            img.mimeType +
+            "|" +
+            Buffer.from(
+              img.data.length <= 2048
+                ? img.data
+                : img.data.subarray(0, 1024),
+            ).toString("base64") +
+            "|" +
+            img.data.length;
+
+          const prevIdx = this._ocrImageState.get(imgHash);
+          if (prevIdx === newestImageIdx) {
+            // Same image, same index → VS Code re-attach → skip
+            anySkipped = true;
+            continue;
+          }
+
+          // New image, or same image at new index (user re-sent) → OCR
+          anyOcred = true;
+          if (token.isCancellationRequested) {
+            throw new vscode.CancellationError();
+          }
+
+          this._ocrImageState.set(imgHash, newestImageIdx);
+
+          const base64Data = Buffer.from(img.data).toString("base64");
+          const imageDataUrl = `data:${img.mimeType};base64,${base64Data}`;
+          const analysisPrompt =
+            userPrompt || "Describe this image in detail.";
+
+          const reason =
+            prevIdx === undefined
+              ? "new image"
+              : `user re-sent (was idx ${prevIdx}, now ${newestImageIdx})`;
+          debugLog("OCR-NEWEST-IMAGE", {
+            imageSizeKB: Math.round(img.data.length / 1024),
+            mimeType: img.mimeType,
+            reason,
+          });
+
+          const description = await this._mcpClient.analyzeImage(
+            imageDataUrl,
+            analysisPrompt,
+          );
+          thisMessageDescriptions.push(
+            this.truncateTextToTokens(
+              description,
+              MAX_OCR_TOKENS,
+              OCR_TRUNCATION_SUFFIX,
+            ),
+          );
         }
 
-        const base64Data = Buffer.from(img.data).toString("base64");
-        const imageDataUrl = `data:${img.mimeType};base64,${base64Data}`;
+        if (anySkipped) {
+          debugLog("OCR-SKIPPED", {
+            reason: "same image, same index (VS Code re-attach)",
+            imageCount: images.length,
+          });
+        }
 
-        const analysisPrompt = userPrompt || "Describe this image in detail.";
-        const description = await this._mcpClient.analyzeImage(
-          imageDataUrl,
-          analysisPrompt
-        );
-        thisMessageDescriptions.push(
-          this.truncateTextToTokens(
-            description,
-            MAX_OCR_TOKENS,
-            OCR_TRUNCATION_SUFFIX
-          )
+        if (anyOcred) {
+          this._lastNewestImageMsgIdx = newestImageIdx;
+
+          const newContent: vscode.LanguageModelTextPart[] = [];
+          for (const textPart of textParts) {
+            newContent.push(new vscode.LanguageModelTextPart(textPart));
+          }
+          if (thisMessageDescriptions.length > 0) {
+            newContent.push(
+              new vscode.LanguageModelTextPart(
+                `\n\n[Image Analysis]:\n${thisMessageDescriptions.join("\n\n---\n\n")}`,
+              ),
+            );
+          }
+          processedMessages.push(
+            vscode.LanguageModelChatMessage.User(newContent),
+          );
+          imageDescriptions.push(...thisMessageDescriptions);
+        }
+      } else {
+        // Older image: strip it — OCR text already lives in model context
+        const textContent = textParts.join(" ");
+        processedMessages.push(
+          vscode.LanguageModelChatMessage.User([
+            textContent
+              ? new vscode.LanguageModelTextPart(textContent)
+              : new vscode.LanguageModelTextPart(
+                  "[Image context already described above]",
+                ),
+          ]),
         );
       }
-
-      // Replace image with text description for non-Vision model
-      const newContent: vscode.LanguageModelTextPart[] = [];
-      for (const textPart of textParts) {
-        newContent.push(new vscode.LanguageModelTextPart(textPart));
-      }
-
-      // Add image descriptions as text (only those for this message)
-      if (thisMessageDescriptions.length > 0) {
-        newContent.push(
-          new vscode.LanguageModelTextPart(
-            `\n\n[Image Analysis]:\n${thisMessageDescriptions.join("\n\n---\n\n")}`
-          )
-        );
-      }
-
-      processedMessages.push(vscode.LanguageModelChatMessage.User(newContent));
     }
 
     return { processedMessages, imageDescriptions };
@@ -445,33 +582,22 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
       const hasImages = this.hasImageInput(messages);
       let processedMessages = messages;
       let effectiveModelId = model.id;
-      /** Whether we switched to a vision fallback model (may need OCR recovery) */
-      let usedVisionFallback = false;
 
       if (hasImages) {
         if (!this.modelSupportsVision(model.id)) {
-          const visionFallback = this.getVisionFallbackModelId();
-          if (visionFallback && visionFallback !== model.id) {
-            console.warn(
-              "[OpenCode Go Model Provider] Switching to vision model for image input",
-              {
-                originalModel: model.id,
-                visionModel: visionFallback,
-              }
-            );
-            effectiveModelId = visionFallback;
-            usedVisionFallback = true;
-          } else {
-            console.warn(
-              "[OpenCode Go Model Provider] No vision model available, using OCR fallback"
-            );
-            const result = await this.processImagesForNonVisionModel(
-              messages,
-              model.id,
-              token
-            );
-            processedMessages = result.processedMessages;
-          }
+          // Always use OCR for non-vision models to keep them on their
+          // original model (preserving context window size).
+          // Switching to a vision fallback can cause token limit errors
+          // when the conversation exceeds the fallback model's smaller context.
+          console.warn(
+            "[OpenCode Go Model Provider] Non-vision model, using OCR for image analysis"
+          );
+          const result = await this.processImagesForNonVisionModel(
+            messages,
+            model.id,
+            token
+          );
+          processedMessages = result.processedMessages;
         }
       }
 
@@ -493,6 +619,28 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
         maxToolResultChars: MAX_TOOL_RESULT_CHARS,
       });
       const mo = options.modelOptions as Record<string, Json> | undefined;
+
+      // Extract thinking level from proposed API modelConfiguration (Insiders)
+      // or from the variant model ID suffix (stable fallback)
+      const modelConfiguration = (
+        options as unknown as {
+          readonly modelConfiguration?: { readonly [key: string]: unknown };
+        }
+      ).modelConfiguration;
+      let thinkingLevel = modelConfiguration?.thinking_effort as
+        | string
+        | undefined;
+
+      // Stable-API fallback: if no modelConfiguration, parse thinking level from
+      // suffixed variant model IDs like "deepseek-v4-pro-high"
+      if (!thinkingLevel) {
+        const parsed = parseVariantModelId(model.id);
+        if (parsed.level) {
+          thinkingLevel = parsed.level;
+          effectiveModelId = parsed.baseId;
+        }
+      }
+
       const maxTokensVal =
         typeof mo?.max_tokens === "number" ? mo.max_tokens : DEFAULT_MAX_TOKENS;
       const temperatureVal =
@@ -543,6 +691,7 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
         maxOutputTokens: effectiveMaxOutputTokens,
         requestedMaxTokens,
         utilizationPct: Math.round((totalEstimatedTokens / tokenLimit) * 100),
+        thinkingLevel: thinkingLevel ?? "none",
       });
       if (totalEstimatedTokens > tokenLimit) {
         console.error(
@@ -580,7 +729,8 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
           temperatureVal,
           trackingProgress,
           token,
-          abortController
+          abortController,
+          thinkingLevel
         );
       } else {
         await this.handleOpenAIRequest(
@@ -594,8 +744,8 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
           trackingProgress,
           token,
           abortController,
-          usedVisionFallback,
-          model.id
+          model.id,
+          thinkingLevel
         );
       }
     } catch (err) {
@@ -633,8 +783,8 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
     trackingProgress: Progress<LanguageModelResponsePart>,
     token: CancellationToken,
     abortController: AbortController,
-    usedVisionFallback: boolean,
-    originalModelId: string
+    originalModelId: string,
+    thinkingLevel?: string
   ): Promise<void> {
     const toolConfig = convertTools(options);
     const apiMessages = convertMessages(processedMessages, {
@@ -675,6 +825,16 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
       requestBody.tool_choice = toolConfig.tool_choice;
     }
 
+    // Inject thinking/reasoning parameters if a level was selected
+    const thinkingParams = getThinkingParams(effectiveModelId, thinkingLevel);
+    if (thinkingParams) {
+      Object.assign(requestBody, thinkingParams);
+      console.log("[OpenCode Go Model Provider] Thinking params injected", {
+        thinkingLevel,
+        params: thinkingParams,
+      });
+    }
+
     const response = await fetch(`${BASE_URL}/chat/completions`, {
       method: "POST",
       headers: {
@@ -692,97 +852,11 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
         "[OpenCode Go Model Provider] API error response",
         errorText
       );
-
-      // If vision fallback failed due to subscription limits (429 + code 1311),
-      // fall back to OCR processing on the original model instead.
-      if (
-        usedVisionFallback &&
-        response.status === 429 &&
-        errorText.includes("1311")
-      ) {
-        console.warn(
-          "[OpenCode Go Model Provider] Vision model unavailable on subscription, falling back to OCR",
-          {
-            originalModel: originalModelId,
-            failedVisionModel: effectiveModelId,
-          }
-        );
-
-        // Reset to original model and process images via OCR
-        effectiveModelId = originalModelId;
-        const ocrResult = await this.processImagesForNonVisionModel(
-          processedMessages,
-          originalModelId,
-          token
-        );
-        processedMessages = ocrResult.processedMessages;
-
-        // Rebuild request with original model + OCR'd messages
-        const ocrApiMessages = convertMessages(processedMessages, {
-          maxToolResultChars: MAX_TOOL_RESULT_CHARS,
-        });
-        const ocrRequestBody: OcGoRequestBody = {
-          model: effectiveModelId,
-          messages: ocrApiMessages,
-          stream: true,
-          stream_options: { include_usage: true },
-          max_tokens: requestedMaxTokens,
-          temperature: temperatureVal,
-        };
-        if (toolConfig.tools) {
-          ocrRequestBody.tools = toolConfig.tools;
-        }
-        if (toolConfig.tool_choice) {
-          ocrRequestBody.tool_choice = toolConfig.tool_choice;
-        }
-
-        console.log(
-          "[OpenCode Go Model Provider] 🔄 Retrying with OCR fallback",
-          {
-            model: effectiveModelId,
-          }
-        );
-
-        const retryResponse = await fetch(`${BASE_URL}/chat/completions`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-            "User-Agent": this.userAgent,
-          },
-          signal: abortController.signal,
-          body: JSON.stringify(ocrRequestBody),
-        });
-
-        if (!retryResponse.ok) {
-          const retryErrorText = await retryResponse.text();
-          console.error(
-            "[OpenCode Go Model Provider] OCR fallback also failed",
-            retryErrorText
-          );
-          throw this.toLanguageModelError(
-            retryResponse.status,
-            retryResponse.statusText,
-            retryErrorText
-          );
-        }
-
-        if (!retryResponse.body) {
-          throw new Error("No response body from OpenCode Go API");
-        }
-
-        await this.processStreamingResponse(
-          retryResponse.body,
-          trackingProgress,
-          token
-        );
-      } else {
-        throw this.toLanguageModelError(
-          response.status,
-          response.statusText,
-          errorText
-        );
-      }
+      throw this.toLanguageModelError(
+        response.status,
+        response.statusText,
+        errorText
+      );
     } else {
       if (!response.body) {
         throw new Error("No response body from OpenCode Go API");
@@ -808,7 +882,8 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
     temperatureVal: number,
     trackingProgress: Progress<LanguageModelResponsePart>,
     token: CancellationToken,
-    abortController: AbortController
+    abortController: AbortController,
+    thinkingLevel?: string
   ): Promise<void> {
     const toolConfig = convertToolsToAnthropic(options);
     const { messages: apiMessages, system } = convertMessagesToAnthropic(
@@ -843,6 +918,16 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
       if (toolConfig.tool_choice && toolConfig.tool_choice !== "auto") {
         requestBody.tool_choice = toolConfig.tool_choice;
       }
+    }
+
+    // Inject thinking/reasoning parameters if a level was selected
+    const thinkingParams = getThinkingParams(effectiveModelId, thinkingLevel);
+    if (thinkingParams) {
+      Object.assign(requestBody, thinkingParams);
+      console.log("[OpenCode Go Model Provider] Anthropic thinking params injected", {
+        thinkingLevel,
+        params: thinkingParams,
+      });
     }
 
     console.log("[OpenCode Go Model Provider] Anthropic request body", {
@@ -1109,6 +1194,8 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
             debugLog("STREAM-DONE", {
               apiPromptTokens: this._usageMetrics.prompt_tokens,
               apiCompletionTokens: this._usageMetrics.completion_tokens,
+              reasoningChars: this._reasoningContentBuffer.length,
+              hasReasoning: this._reasoningContentBuffer.length > 0,
             });
             console.log(
               "[OpenCode Go Model Provider] Stream [DONE], final usage metrics:",
@@ -1267,8 +1354,12 @@ export class OcGoChatModelProvider implements LanguageModelChatProvider {
     const deltaObj = choice.delta;
 
     // Handle reasoning content
-    // Moonshot AI/Kimi streams reasoning in the `reasoning` field (not `reasoning_content`);
-    // we accumulate it here and later emit it as a data part so it is preserved in history.
+    // DeepSeek, GLM, Qwen, MiMo stream reasoning in the `reasoning_content` field.
+    // Moonshot AI/Kimi streams reasoning in the `reasoning` field (not `reasoning_content`).
+    // We accumulate both here and later emit as a data part so it is preserved in history.
+    if (deltaObj?.reasoning_content) {
+      this._reasoningContentBuffer += String(deltaObj.reasoning_content);
+    }
     if (deltaObj?.reasoning) {
       this._reasoningContentBuffer += String(deltaObj.reasoning);
     }

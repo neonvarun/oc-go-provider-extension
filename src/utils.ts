@@ -353,9 +353,9 @@ export function convertMessages(
           p.data instanceof Uint8Array
         ) {
           try {
-            const json = JSON.parse(new TextDecoder().decode(p.data));
-            if (typeof json.content === "string") {
-              reasoningContent = json.content;
+            const json: unknown = JSON.parse(new TextDecoder().decode(p.data));
+            if (typeof json === "object" && json !== null && typeof (json as Record<string, unknown>).content === "string") {
+              reasoningContent = (json as { content: string }).content;
             }
           } catch {
             // Ignore malformed reasoning data parts
@@ -827,7 +827,7 @@ export function estimateTokens(text: string): number {
 }
 
 const MIN_IMAGE_TOKENS = 1500;
-const MAX_IMAGE_TOKENS = 6000;
+const MAX_IMAGE_TOKENS = 1500;
 
 /**
  * Estimate message array tokens

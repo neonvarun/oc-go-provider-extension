@@ -135,6 +135,7 @@ export class LanguageModelChatMessage {
 export interface LanguageModelChatInformation {
   id: string;
   name: string;
+  detail?: string;
   tooltip?: string;
   family: string;
   version: string;
@@ -143,6 +144,9 @@ export interface LanguageModelChatInformation {
   capabilities: {
     toolCalling?: boolean | number;
     imageInput?: boolean;
+  };
+  configurationSchema?: {
+    readonly properties?: Record<string, unknown>;
   };
 }
 

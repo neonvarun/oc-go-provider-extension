@@ -1,4 +1,21 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
+
+const DEBUG_LOG_PATH = path.join(os.homedir(), "oc-go-debug.log");
+
+function debugLog(msg: string, data?: Record<string, unknown>): void {
+  const timestamp = new Date().toISOString();
+  const line = data
+    ? `[${timestamp}] ${msg} ${JSON.stringify(data)}\n`
+    : `[${timestamp}] ${msg}\n`;
+  try {
+    fs.appendFileSync(DEBUG_LOG_PATH, line);
+  } catch {
+    // Ignore write errors
+  }
+}
 
 /**
  * OpenCode Go MCP Client for making HTTP-based MCP tool calls
@@ -32,6 +49,13 @@ export class OcGoMcpClient {
       throw new Error("OpenCode Go API key not found");
     }
 
+    // Log image size for tracking
+    const imageSizeBytes = Math.ceil((imageData.length * 3) / 4);
+    debugLog("OCR-MIMO-CALL", {
+      prompt: prompt.length > 80 ? prompt.slice(0, 80) + "..." : prompt,
+      imageSizeKB: Math.round(imageSizeBytes / 1024),
+    });
+
     // Call Vision model via chat completions endpoint
     const response = await fetch(
       "https://opencode.ai/zen/go/v1/chat/completions",
@@ -52,7 +76,7 @@ export class OcGoMcpClient {
               ],
             },
           ],
-          max_tokens: 2000,
+          max_tokens: 16000,
         }),
       }
     );
