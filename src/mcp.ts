@@ -49,11 +49,11 @@ export class OcGoMcpClient {
       throw new Error("OpenCode Go API key not found");
     }
 
-    // Log image size for tracking
+    // Log image metadata for tracking (never log user prompts)
     const imageSizeBytes = Math.ceil((imageData.length * 3) / 4);
     debugLog("OCR-MIMO-CALL", {
-      prompt: prompt.length > 80 ? prompt.slice(0, 80) + "..." : prompt,
       imageSizeKB: Math.round(imageSizeBytes / 1024),
+      promptLength: prompt.length,
     });
 
     // Call Vision model via chat completions endpoint
